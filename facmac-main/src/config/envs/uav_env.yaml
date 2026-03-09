@@ -1,0 +1,61 @@
+env: uav
+
+# --- 1. 环境具体参数 (Environment Specific Arguments) ---
+# 这些参数会被传递给你的 UAV 环境类的 __init__ 方法
+env_args:
+  map_name: "3Duav" # 建议给你的场景起个名字，用于日志记录
+  n_agents: 3
+  n_static_obstacles: 2
+
+  # 物理与空间限制
+  space_size: 100.0
+  goal_radius: 5.0
+  v_max: 2.0
+  dt: 0.2 # 时间步长，这个对连续控制的物理反馈非常重要，建议取消注释
+  episode_limit: 200 # 每个episode的最大步数
+  max_steps: 200 # 同上，确保与limit一致
+
+  # 状态/观测配置 (参考 SC2)
+  state_last_action: True # 在全局 State 中包含上一步动作，对 Critic 很重要
+  state_timestep_number: False # 是否包含当前时间步信息
+  obs_last_action: False # 通常 Agent 自身会处理 last_action，环境原生观测可以设为 False
+  obs_agent_id: False # 同上，Agent 网络通常会自动 concat ID
+
+  # 奖励函数参数 (建议放在这里以便通过 yaml 调参，而不用改代码)
+#  reward_args:
+#    k_prog: 10.0      # 接近目标的奖励权重
+#    k_coll_obs: 1.0   # 撞障碍物惩罚权重
+#    k_coll_agent: 1.0 # 撞队友惩罚权重
+#    k_goal: 200.0     # 到达目标奖励
+#    k_time: -0.1      # 时间惩罚 (鼓励快速到达)，建议设为负的小值
+#    safe_dist_obs: 2.0
+#    reward_clip: 20.0
+
+  # 调试模式
+  debug: False
+  seed: 42 # 可以固定环境随机种子
+
+  # 结果与日志
+  results_dir: "results"
+  save_episode_json: False
+  results_keep_last: 500
+  summary_csv_path: "results/summary.csv"
+
+  # 日志配置
+  log_env_reset: False
+  log_goal_event: False
+  log_episode_save: False
+  logger_name: "MultiUAVEnv"
+
+# --- 2. 运行与日志参数 (Runner & Logging) ---
+# 这些参数控制训练流程，必须与算法参数区分开
+test_greedy: True # 测试时是否使用确定性策略（不加噪声）
+test_nepisode: 20 # 每次测试运行多少个 episode
+test_interval: 5000 # 多少步训练后进行一次测试
+log_interval: 200 # 多少步打印一次日志
+runner_log_interval: 200 # 配合 run_mode: "sequential"，每 200 步记录一次运行数据
+learner_log_interval: 200 # 配合 learn_interval: 1，每更新一次网络就记录一次梯度情况。
+t_max: 5000000 # 总训练步数 (UAV 连续控制通常需要比 SC2 更长的步数收敛)
+
+# --- 3. 设备参数 ---
+use_cuda: True # 强制使用 GPU，或者保持 "auto"
