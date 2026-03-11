@@ -5,7 +5,7 @@ env: uav
 env_args:
   map_name: "3Duav" # 建议给你的场景起个名字，用于日志记录
   n_agents: 3
-  n_static_obstacles: 2
+  n_static_obstacles: 0
 
   # 物理与空间限制
   space_size: 100.0

@@ -104,10 +104,10 @@ class UAVEnv(MultiAgentEnv):
         next_obs, _state, rewards, done, info = self.env.step(actions)
 
         # 1. 奖励必须求和 (FACMAC 的架构决定了它通常处理团队总奖励)
-        # total_reward = np.sum(rewards)
+        total_reward = np.sum(rewards)
 
         # 将求和改为求平均，以适应多智能体环境中的奖励分配
-        total_reward = np.mean(rewards)
+        # total_reward = np.mean(rewards)
 
         # 2. 这里的 done 如果是 bool，需要确保 Runner 能识别
         return total_reward, done, info

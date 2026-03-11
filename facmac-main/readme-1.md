@@ -16,7 +16,12 @@ python -m src.main --config=facmac_uav --env-config=uav_env with test_nepisode=1
 
 - 如果你已经在算法配置文件（例如 `src/config/algs/facmac_pp.yaml`）中写入了 `t_max_episodes: 10000`，可以直接运行而不用在命令行传参：
 ```
-python -m src.main --config=facmac_pp --env-config=uav_env
+python -m src.main --config=facmac_uav --env-config=uav_env
+```
+
+4. 在断点重新启用模型训练
+```
+python -m src.main --config=facmac_uav --env-config=uav_env with checkpoint_path="results/models/facmac_uav_navigation__2026-03-10_22-40-57"
 ```
 
 说明：

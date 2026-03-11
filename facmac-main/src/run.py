@@ -37,7 +37,21 @@ def run(_run, _config, _log, pymongo_client=None):
     _log.info("\n\n" + experiment_params + "\n")
 
     # configure tensorboard logger
-    unique_token = "{}__{}".format(args.name, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    checkpoint_path = getattr(args, "checkpoint_path", "")
+    resume_token = ""
+    if checkpoint_path:
+        # If resuming, reuse the original run token so logs continue under the same run directory.
+        cp_norm = os.path.normpath(checkpoint_path)
+        cp_base = os.path.basename(cp_norm)
+        if cp_base.isdigit():
+            resume_token = os.path.basename(os.path.dirname(cp_norm))
+        else:
+            resume_token = cp_base
+
+    if resume_token:
+        unique_token = resume_token
+    else:
+        unique_token = "{}__{}".format(args.name, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     args.unique_token = unique_token
     if args.use_tensorboard:
         tb_logs_direc = os.path.join(dirname(dirname(abspath(__file__))), "results", "tb_logs")
@@ -256,6 +270,8 @@ def run_sequential(args, logger, dual_logger=None):
     if args.use_cuda:
         learner.cuda()
 
+    resumed_timestep = 0
+
     if args.checkpoint_path != "":
 
         timesteps = []
@@ -284,6 +300,7 @@ def run_sequential(args, logger, dual_logger=None):
         logger.console_logger.info("Loading model from {}".format(model_path))
         learner.load_models(model_path)
         runner.t_env = timestep_to_load
+        resumed_timestep = timestep_to_load
 
         if args.evaluate or args.save_replay:
             evaluate_sequential(args, runner)
@@ -293,7 +310,7 @@ def run_sequential(args, logger, dual_logger=None):
     episode = 0
     last_test_T = - args.test_interval - 1
     last_log_T = 0
-    model_save_time = 0
+    model_save_time = resumed_timestep
 
     start_time = time.time()
     last_time = start_time

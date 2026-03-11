@@ -174,9 +174,11 @@ def compute_step_reward(
     # =============================
     PROGRESS_SCALE = 3.0  # 🚩 稍微调低：防止过度贪婪走直线撞墙
     COLLISION_PENALTY = -5.0  # 🚩 撞墙或互撞惩罚：保持痛感，但不至于让它完全不敢动
-    STEP_PENALTY = -0.05  # 🚩 新增核心：无论动不动，每活一步就扣分，逼迫尽快到达
+    # STEP_PENALTY = -0.05  # 🚩 新增核心：无论动不动，每活一步就扣分，逼迫尽快到达
+    STEP_PENALTY = -0.01  # 🚩 新增核心：无论动不动，每活一步就扣分，逼迫尽快到达
     ARRIVAL_BONUS = 50.0  # 🚩 史诗级加强：将到达终点变成绝对的终极诱惑
-    UAV_SAFE_DIST = 0.6  # 🚩 新增：无人机之间的安全距离（防止多机互撞死锁）
+    # UAV_SAFE_DIST = 0.6  # 🚩 新增：无人机之间的安全距离（防止多机互撞死锁）
+    UAV_SAFE_DIST = 0.0
     REWARD_SCALE = 10.0  # 保持您的缩放，防止 Q 值爆炸
 
     goal = np.asarray(goal)
@@ -243,9 +245,9 @@ def compute_step_reward(
         comp["step_penalty"] = STEP_PENALTY
 
         # 如果连动都不动，再额外加倍扣分
-        speed = np.linalg.norm(vel)
-        if speed < 1e-3:
-            comp["step_penalty"] += STEP_PENALTY * 2
+        # speed = np.linalg.norm(vel)
+        # if speed < 1e-3:
+        #     comp["step_penalty"] += STEP_PENALTY * 2
 
         # ==================================================
         # 4️⃣ 到达奖励

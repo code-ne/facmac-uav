@@ -167,6 +167,7 @@ class MultiUAVEnv:
         # Per-agent flags
         self.arrived_mask = np.zeros(self.n_agents, dtype=bool)  # 记录每个agent是否已到达目标
         self.colliding_mask = np.zeros(self.n_agents, dtype=bool)  # 逐agent碰撞占用状态（用于事件计数）
+        self.crashed_mask = np.zeros(self.n_agents, dtype=bool)    # 新增：永久坠毁状态
 
         # Event tracking: record first step index when each agent arrives or collides (-1 means never)
         self.first_arrival_step = np.full(self.n_agents, -1, dtype=int)
@@ -175,9 +176,9 @@ class MultiUAVEnv:
         # Compatibility attributes used by the wrapper UAVEnv
         self.num_uav = self.n_agents
         # observation dimension matches _agent_obs output length
-        self.obs_dim = 9
-        # state dimension is flattened positions + goal (n_agents*3 + 3)
-        self.state_dim = self.n_agents * 3 + 3
+        self.obs_dim = 15
+        # state dimension is flattened positions + goal (n_agents*3 + 3) + obstacles (n_static*5)
+        self.state_dim = self.n_agents * 3 + 3 + self.n_static * 5
         # action dimension (3D continuous velocity)
         self.action_dim = 3
 
@@ -238,6 +239,7 @@ class MultiUAVEnv:
         self.prev_pos = None
         self.arrived_mask = np.zeros(self.n_agents, dtype=bool)  # 初始化到达标志
         self.colliding_mask = np.zeros(self.n_agents, dtype=bool)  # 初始化碰撞占用标志
+        self.crashed_mask = np.zeros(self.n_agents, dtype=bool)  # 重置坠毁状态
 
     # TODO(随机种子)：输出随机主种子和子种子
     # print(main_seed)
@@ -270,6 +272,7 @@ class MultiUAVEnv:
         self.step_count = 0
         self.arrived_mask = np.zeros(self.n_agents, dtype=bool)  # 重置到达标志
         self.colliding_mask = np.zeros(self.n_agents, dtype=bool)  # 重置碰撞占用标志
+        self.crashed_mask = np.zeros(self.n_agents, dtype=bool)  # 重置坠毁状态，避免跨episode泄漏
         # Reset event tracking
         self.first_arrival_step[:] = -1
         self.first_collision_step[:] = -1
@@ -288,6 +291,9 @@ class MultiUAVEnv:
     def _in_bounds(self,p):
         return clamp_pos(p, self.space_size)
 
+    def _is_out_of_bounds(self, p):
+        return np.any(p < 0.0) or np.any(p > float(self.space_size))
+
     # 用于碰撞检测
     def _collides_any(self,p):
         for c in self.obstacles:
@@ -298,20 +304,92 @@ class MultiUAVEnv:
                 return True
         return False
 
+    def _simple_ray_cast(self, pos, direction, max_range=None):
+        if max_range is None:
+            max_range = float(self.space_size)
+
+        p = np.array(pos, dtype=float)
+        d = np.array(direction, dtype=float)
+        norm_d = np.linalg.norm(d)
+        if norm_d > 1e-6:
+            d = d / norm_d
+        else:
+            return max_range
+
+        t = 0.0
+        # Use iterative sphere tracing
+        for _ in range(30):
+            current_p = p + t * d
+            min_dist = float('inf')
+
+            # Check static obstacles
+            for obs in self.obstacles:
+                # distance_to_point returns signed distance if inside (negative)
+                dist = obs.distance_to_point(current_p)
+                if dist < min_dist:
+                    min_dist = dist
+
+            # Check dynamic objects
+            for dobj in self.dynamic_objs:
+                center_dist = np.linalg.norm(current_p - dobj['pos'])
+                dist = center_dist - dobj['radius']
+                if dist < min_dist:
+                    min_dist = dist
+
+            # If inside or very close, assume hit
+            if min_dist <= 0.01:
+                return t
+
+            t += min_dist
+            if t >= max_range:
+                return max_range
+        return max_range
+
     def _agent_obs(self,idx):
         pos = self.pos[idx]
         pos_norm = pos / self.space_size
-        v = self.vel[idx] / self.v_max  # 归一化速度
-        goal_norm = self.goal / self.space_size
-        d2g = np.linalg.norm(goal_norm - pos_norm)
-        vec = goal_norm - pos_norm
-        bearing = math.atan2(vec[1], vec[0])
-        collision_flag = 1.0 if self._collides_any(pos) else 0.0
-        return np.array([pos_norm[0],pos_norm[1],pos_norm[2], v[0],v[1],v[2], d2g, bearing, collision_flag], dtype=float)
+        v = self.vel[idx] / self.v_max
+
+        # Modification 1: Normalized relative goal vector
+        vec_to_goal = (self.goal - pos) / self.space_size
+
+        # Modification 2: 6-direction Lidar sensors
+        directions = [
+            [1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]
+        ]
+        # Use space_size as max sensing range for normalization
+        sensor_range = float(self.space_size)
+        sensor_readings = []
+        for d in directions:
+            dist = self._simple_ray_cast(pos, d, max_range=sensor_range)
+            sensor_readings.append(dist / sensor_range)
+
+        return np.concatenate([
+            pos_norm, v, vec_to_goal, np.array(sensor_readings, dtype=float)
+        ])
 
     def _get_obs_state(self):
-        obs = [self._agent_obs(i) for i in range(self.n_agents)]    # 遍历每个无人机获得观测
-        state = np.concatenate([self.pos.flatten(), self.goal.flatten()])   # 状态是所有无人机位置和目标点位置的拼接
+        obs = [self._agent_obs(i) for i in range(self.n_agents)]
+
+        # 1. 无人机位置归一化
+        state_uav = self.pos.flatten() / self.space_size
+        # 2. 目标点归一化
+        state_goal = self.goal.flatten() / self.space_size
+
+        # 3. 提取并归一化障碍物信息
+        state_obs_list = []
+        for obs_obj in self.obstacles:
+            state_obs_list.extend([
+                obs_obj.x / self.space_size,
+                obs_obj.y / self.space_size,
+                obs_obj.radius / self.space_size,
+                obs_obj.z_min / self.space_size,
+                obs_obj.z_max / self.space_size
+            ])
+        state_obs = np.array(state_obs_list, dtype=float)
+
+        # 拼接全新的全局状态
+        state = np.concatenate([state_uav, state_goal, state_obs])
         return obs, state
 
     def step(self, actions):
@@ -321,7 +399,7 @@ class MultiUAVEnv:
         action_scale = float(self.v_max)
         # 更新速度和位置
         for i in range(self.n_agents):
-            if self.arrived_mask[i]:
+            if self.arrived_mask[i] or self.crashed_mask[i]:
                 self.vel[i] = np.zeros(3, dtype=float)
                 self.pos[i] = prev_pos[i]
                 continue
@@ -333,14 +411,16 @@ class MultiUAVEnv:
             self.pos[i] = self._in_bounds(self.pos[i] + self.vel[i] * self.dt)
         # 更新arrived_mask：首次到达标志
         dists = np.linalg.norm(self.pos - self.goal, axis=1)
-        newly_arrived = (dists <= self.goal_radius) & (~self.arrived_mask)
+        # newly_arrived = (dists <= self.goal_radius) & (~self.arrived_mask)
+        newly_arrived = (dists <= self.goal_radius) & (~self.arrived_mask) & (~self.crashed_mask)
         # 先记录老的 mask，再更新，以方便计算 reached_new
         old_arrived = self.arrived_mask.copy()
         self.arrived_mask[newly_arrived] = True
 
         # 检查穿越目标球体的情况
         for i in range(self.n_agents):
-            if not self.arrived_mask[i] and _segment_intersects_sphere(prev_pos[i], self.pos[i], self.goal, self.goal_radius):
+            if not self.arrived_mask[i] and not self.crashed_mask[i] and _segment_intersects_sphere(prev_pos[i],self.pos[i],self.goal,self.goal_radius):
+            # if not self.arrived_mask[i] and _segment_intersects_sphere(prev_pos[i], self.pos[i], self.goal, self.goal_radius):
                 self.arrived_mask[i] = True
                 newly_arrived[i] = True
                 if self.log_goal_event:
@@ -356,10 +436,25 @@ class MultiUAVEnv:
 
         # 计算碰撞：既检测当前位置是否在障碍内，也检测移动段是否穿过障碍（高速穿越）
         coll_now = np.zeros(self.n_agents, dtype=bool)
+        safe_uav_dist = self.cfg.get('safe_uav_dist', 0.5)
+
         for i in range(self.n_agents):
-            # point collision at new position
-            coll = self._collides_any(self.pos[i])
-            # if not colliding at end, check whether the movement segment intersects any static cylinder obstacle
+            # 如果已经坠毁或到达，不产生新的碰撞事件
+            if self.arrived_mask[i] or self.crashed_mask[i]:
+                continue
+
+            coll = False
+
+            # 1. 越界检测
+            intended_pos = prev_pos[i] + self.vel[i] * self.dt
+            if self._is_out_of_bounds(intended_pos):
+                coll = True
+
+            # 2. 静态/动态环境障碍物检测
+            if not coll:
+                coll = self._collides_any(self.pos[i])
+
+            # 3. 高速穿越线段检测
             if (not coll) and (prev_pos is not None):
                 for obs in self.obstacles:
                     try:
@@ -367,9 +462,7 @@ class MultiUAVEnv:
                             coll = True
                             break
                     except Exception:
-                        # ignore individual obstacle errors
                         continue
-                # also check dynamic spherical objects by segment-sphere intersection
                 if (not coll) and len(self.dynamic_objs) > 0:
                     for d in self.dynamic_objs:
                         try:
@@ -378,11 +471,29 @@ class MultiUAVEnv:
                                 break
                         except Exception:
                             continue
+
+            # 4. 无人机互撞检测 (Inter-UAV Collision)
+            if not coll:
+                for j in range(self.n_agents):
+                    if i == j:
+                        continue
+                    if self.arrived_mask[j]:
+                        continue
+                    dist_ij = np.linalg.norm(self.pos[i] - self.pos[j])
+                    if dist_ij < safe_uav_dist:
+                        coll = True
+                        break
+
             coll_now[i] = coll
+
         collisions_step = coll_now.astype(int).tolist()
-        collisions_new_mask = (~self.colliding_mask) & coll_now
+        # 确保只有没坠毁的无人机才会触发“新碰撞”
+        collisions_new_mask = (~self.colliding_mask) & coll_now & (~self.crashed_mask)
         collisions_new = collisions_new_mask.astype(int).tolist()
+
         self.colliding_mask = coll_now  # 更新占用状态
+        self.crashed_mask |= collisions_new_mask  # <--- 核心：真正把发生碰撞的无人机标记为永久坠毁
+        # -----------------------------------
 
         # Record first collision steps
         for i in range(self.n_agents):
@@ -396,12 +507,14 @@ class MultiUAVEnv:
                                             goal_radius=self.goal_radius, v_max=self.v_max,
                                             already_reached=self.arrived_mask.astype(int).tolist())
         # record per-step reward decomposition if provided by reward function
-        collision_penalty = -5.0  # 建议先设为 -5.0，不要直接用 -30.0，防止梯度爆炸
+        # collision_penalty = -5.0  # 建议先设为 -5.0，不要直接用 -30.0，防止梯度爆炸
 
         for i in range(self.n_agents):
             # 使用 collisions_new_mask 确保只在撞击的那一帧扣分
-            if collisions_new_mask[i]:
-                rewards[i] += collision_penalty
+            # if collisions_new_mask[i]:
+            #     rewards[i] += collision_penalty
+            # if self.crashed_mask[i] and not collisions_new_mask[i]:
+            #     rewards[i] = 0.0  # 变成残骸后，不再产生任何奖励和惩罚
 
                 # 同步更新 info 里的组件信息，方便日志查看
                 if 'components' in info and info['components'] is not None:
@@ -411,9 +524,8 @@ class MultiUAVEnv:
                     if isinstance(comps, (list, tuple)) and i < len(comps):
                         try:
                             if isinstance(comps[i], dict):
-                                comps[i]['coll_reward'] = collision_penalty
+                                comps[i]['coll_reward'] = self.cfg.get('reward', {}).get('collision_penalty', -5.0)
                         except Exception:
-                            # If any unexpected issue occurs, skip augmenting components for safety
                             pass
 
 
@@ -478,10 +590,12 @@ class MultiUAVEnv:
         # 附加：碰撞占用（逐步）与碰撞事件（进入时）
         info['collisions_step'] = collisions_step
         info['collisions_new'] = collisions_new
+        info['crashed'] = self.crashed_mask.astype(int).tolist()
         done = False
-        if all(self.arrived_mask):
+        if np.all(self.arrived_mask | self.crashed_mask):
             done = True
-            info['success'] = True
+            if all(self.arrived_mask):
+                info['success'] = True
         if self.step_count >= self.max_steps:
             done = True
 
