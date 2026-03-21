@@ -5,6 +5,8 @@ from numbers import Number
 import torch as th
 import numpy as np
 import copy
+import os
+import json
 
 
 def safe_add(a, b):
@@ -126,6 +128,7 @@ class EpisodeRunner:
         # NEW: placeholders for per-episode logging payload
         self.last_episode_env_scalars = None
         self.last_episode_details = None
+        self._global_episode_id = 0
 
     def setup(self, scheme, groups, preprocess, mac):
         self.new_batch = partial(EpisodeBatch, scheme, groups, self.batch_size, self.episode_limit + 1,
@@ -156,8 +159,13 @@ class EpisodeRunner:
         # NEW: episode-wise collections
         actions_seq = []  # list[ per-step actions for all agents ]
         step_rewards = []
+        step_components_seq = []
+        # Per-episode component accumulators (must reset at each run/episode).
+        episode_component_sums_all_agents = {}
+        episode_component_sums_per_agent = []
         traj_seq = []  # optional trajectory if env exposes positions
         last_env_info = {}
+        base_env = getattr(self.env, "env", self.env)
 
         while not terminated:
 
@@ -214,11 +222,53 @@ class EpisodeRunner:
             # record step reward and optional trajectory
             step_rewards.append(float(reward))
             try:
-                if hasattr(self.env, "pos"):
+                if hasattr(base_env, "pos"):
                     # ensure serializable
-                    traj_seq.append(np.array(self.env.pos).tolist())
+                    traj_seq.append(np.array(base_env.pos).tolist())
             except Exception:
                 pass
+
+            # Collect per-step reward components as a robust fallback when
+            # final env_info does not include episode_components.
+            try:
+                comps = env_info.get("components", None) if isinstance(env_info, dict) else None
+                if comps is None:
+                    step_components_seq.append(None)
+                else:
+                    cleaned = []
+                    for comp in comps:
+                        if not isinstance(comp, dict):
+                            cleaned.append(comp)
+                            continue
+                        cd = {}
+                        for kk, vv in comp.items():
+                            if isinstance(vv, (np.floating, float)):
+                                cd[kk] = float(vv)
+                            elif isinstance(vv, (np.integer, int)):
+                                cd[kk] = int(vv)
+                            else:
+                                cd[kk] = vv
+                        cleaned.append(cd)
+                    step_components_seq.append(cleaned)
+
+                    # Update per-episode sums online so stats cannot leak across episodes.
+                    while len(episode_component_sums_per_agent) < len(cleaned):
+                        episode_component_sums_per_agent.append({})
+
+                    for aid, comp in enumerate(cleaned):
+                        if not isinstance(comp, dict):
+                            continue
+                        for k, v in comp.items():
+                            if isinstance(v, (bool, int, float, np.integer, np.floating)):
+                                fv = float(v)
+                                episode_component_sums_all_agents[k] = float(
+                                    episode_component_sums_all_agents.get(k, 0.0) + fv
+                                )
+                                episode_component_sums_per_agent[aid][k] = float(
+                                    episode_component_sums_per_agent[aid].get(k, 0.0) + fv
+                                )
+            except Exception:
+                step_components_seq.append(None)
             last_env_info = env_info
 
             post_transition_data = {
@@ -322,7 +372,173 @@ class EpisodeRunner:
             "env_info": last_env_info,
         }
 
+        # Episode-level component aggregation for easy reward diagnosis.
+        source_episode_id = int(kwargs.get("episode", 0))
+        episode_id = int(self._global_episode_id)
+        self._global_episode_id += 1
+        run_token = str(getattr(self.args, "unique_token", "run"))
+        save_interval = max(1, int(getattr(self.args, "artifact_save_interval", 10)))
+        should_save_artifacts = (episode_id % save_interval) == 0
+        render_dir = os.path.join(self.args.local_results_path, "renders", run_token)
+        comp_json_path = None
+        render_png_path = None
+        ep_components = None
+        if isinstance(last_env_info, dict):
+            ep_components = last_env_info.get("episode_components", None)
+        if not (isinstance(ep_components, (list, tuple)) and len(ep_components) > 0):
+            if len(step_components_seq) > 0:
+                ep_components = step_components_seq
+        comp_sums_all = None
+        comp_sums_per_agent = None
+        comp_sums_per_agent_labeled = None
+        if isinstance(ep_components, (list, tuple)) and len(ep_components) > 0:
+            comp_sums_all, comp_sums_per_agent = self._summarize_episode_components(ep_components)
+        elif len(episode_component_sums_all_agents) > 0:
+            comp_sums_all = episode_component_sums_all_agents
+            comp_sums_per_agent = episode_component_sums_per_agent
+
+        if comp_sums_all is not None:
+            if isinstance(comp_sums_per_agent, list):
+                comp_sums_per_agent_labeled = {}
+                for i, item in enumerate(comp_sums_per_agent):
+                    comp_sums_per_agent_labeled["uav_{}".format(i + 1)] = item if isinstance(item, dict) else {}
+            self.last_episode_details["episode_component_sums"] = comp_sums_all
+            self.last_episode_details["episode_component_sums_per_agent"] = comp_sums_per_agent
+            self.last_episode_details["episode_component_sums_per_agent_labeled"] = comp_sums_per_agent_labeled
+
+            if getattr(self.args, "print_components", False):
+                try:
+                    self.logger.console_logger.info(
+                        "[components][episode-sum] t_env={} episode={} sums={}".format(
+                            self.t_env, episode_id, comp_sums_all
+                        )
+                    )
+                except Exception:
+                    pass
+
+        # Save component summary JSON every N episodes to control artifact volume.
+        if should_save_artifacts:
+            try:
+                os.makedirs(render_dir, exist_ok=True)
+                comp_json_path = os.path.join(render_dir, "episode_{:06d}_components.json".format(episode_id))
+                arrival_audit = last_env_info.get("per_agent_arrival_audit") if isinstance(last_env_info, dict) else None
+                arrival_mode = last_env_info.get("arrival_mode") if isinstance(last_env_info, dict) else None
+                reached_by_distance = last_env_info.get("reached_by_distance") if isinstance(last_env_info, dict) else None
+                reached_by_segment = last_env_info.get("reached_by_segment") if isinstance(last_env_info, dict) else None
+                moved_steps = last_env_info.get("moved_steps") if isinstance(last_env_info, dict) else None
+                min_dist_to_goal = last_env_info.get("min_dist_to_goal") if isinstance(last_env_info, dict) else None
+                termination_reason = last_env_info.get("termination_reason") if isinstance(last_env_info, dict) else None
+                env_max_steps = last_env_info.get("max_steps") if isinstance(last_env_info, dict) else None
+                env_episode_limit = last_env_info.get("episode_limit") if isinstance(last_env_info, dict) else None
+                with open(comp_json_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "episode_id": episode_id,
+                            "source_episode_id": source_episode_id,
+                            "t_env": int(self.t_env),
+                            "episode_steps": int(self.t),
+                            "save_interval": save_interval,
+                            "has_episode_components": bool(isinstance(ep_components, (list, tuple)) and len(ep_components) > 0),
+                            "component_sums_all_agents": comp_sums_all,
+                            "component_sums_per_agent": comp_sums_per_agent,
+                            "component_sums_per_agent_labeled": comp_sums_per_agent_labeled,
+                            "arrival_audit": arrival_audit,
+                            "arrival_mode": arrival_mode,
+                            "reached_by_distance": reached_by_distance,
+                            "reached_by_segment": reached_by_segment,
+                            "moved_steps": moved_steps,
+                            "min_dist_to_goal": min_dist_to_goal,
+                            "termination_reason": termination_reason,
+                            "max_steps": env_max_steps,
+                            "episode_limit": env_episode_limit,
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                self.last_episode_details["component_summary_json"] = comp_json_path
+                self.logger.console_logger.info("Saved component summary to {}".format(comp_json_path))
+            except Exception as e:
+                self.logger.console_logger.warning("Failed to save component summary JSON: {}".format(e))
+
+        # Episode-level components print (once per episode) to avoid noisy per-step logs.
+        if getattr(self.args, "print_components", False):
+            try:
+                final_components = None
+                ep_components = None
+                if isinstance(last_env_info, dict):
+                    final_components = last_env_info.get("components", None)
+                    ep_components = last_env_info.get("episode_components", None)
+                if final_components is not None or ep_components is not None:
+                    n_steps = len(ep_components) if isinstance(ep_components, (list, tuple)) else 0
+                    self.logger.console_logger.info(
+                        "[components][episode] t_env={} episode={} steps={} final_step_components={}".format(
+                            self.t_env,
+                            episode_id,
+                            n_steps,
+                            final_components,
+                        )
+                    )
+            except Exception:
+                pass
+
+        # Optional: save a 3D trajectory image every N episodes via env.render(...).
+        if should_save_artifacts and getattr(self.args, "save_3d_trajectory", False) and hasattr(base_env, "render"):
+            try:
+                os.makedirs(render_dir, exist_ok=True)
+                render_png_path = os.path.join(render_dir, "episode_{:06d}_3d.png".format(episode_id))
+                base_env.render(save_path=render_png_path, traj=traj_seq)
+                self.last_episode_details["render_3d_path"] = render_png_path
+                self.logger.console_logger.info("Saved 3D trajectory render to {}".format(render_png_path))
+            except Exception as e:
+                self.logger.console_logger.warning("Failed to save 3D trajectory render: {}".format(e))
+
+        # Append one-line artifact index (JSONL) for easy lookup and pairing.
+        if should_save_artifacts:
+            try:
+                os.makedirs(render_dir, exist_ok=True)
+                index_path = os.path.join(render_dir, "artifacts_index.jsonl")
+                with open(index_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "episode_id": episode_id,
+                        "source_episode_id": source_episode_id,
+                        "t_env": int(self.t_env),
+                        "episode_steps": int(self.t),
+                        "save_interval": save_interval,
+                        "component_summary_json": comp_json_path,
+                        "trajectory_png": render_png_path,
+                    }, ensure_ascii=False) + "\n")
+                self.last_episode_details["artifact_index_jsonl"] = index_path
+            except Exception as e:
+                self.logger.console_logger.warning("Failed to append artifact index: {}".format(e))
+
         return self.batch
+
+    def _summarize_episode_components(self, episode_components):
+        """Aggregate numeric component keys across all steps.
+        Returns:
+            - all_agents: dict[key -> total]
+            - per_agent: list[dict[key -> total]]
+        """
+        all_agents = {}
+        per_agent = []
+
+        for step_comps in episode_components:
+            if not isinstance(step_comps, (list, tuple)):
+                continue
+            while len(per_agent) < len(step_comps):
+                per_agent.append({})
+
+            for aid, comp in enumerate(step_comps):
+                if not isinstance(comp, dict):
+                    continue
+                for k, v in comp.items():
+                    if isinstance(v, (bool, int, float, np.integer, np.floating)):
+                        fv = float(v)
+                        all_agents[k] = float(all_agents.get(k, 0.0) + fv)
+                        per_agent[aid][k] = float(per_agent[aid].get(k, 0.0) + fv)
+
+        return all_agents, per_agent
 
     def _log(self, returns, stats, prefix):
         self.logger.log_stat(prefix + "return_mean", np.mean(returns), self.t_env)

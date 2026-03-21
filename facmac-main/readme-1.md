@@ -48,7 +48,7 @@ dir src\config\envs\* -Name
 7. 服务器上运行tensorboard
 ```angular2html
 首先在服务器终端进入项目目录，然后在命令行输入：（results/logs是指tensorboard文件存放路径）
-tensorboard --logdir results/logs --port 6006
+tensorboard --logdir results/tensorboard --port 6006
 然后在本地终端进行端口转发：
 ssh -L 6006:localhost:6006 user@server_address（ ssh -L 6006:localhost:6006 gy2024@172.23.206.107）
 最好在本地浏览器访问 http://localhost:6006 就可以看到tensorboard界面了

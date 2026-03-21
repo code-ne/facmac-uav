@@ -4,16 +4,24 @@ env: uav
 # 这些参数会被传递给你的 UAV 环境类的 __init__ 方法
 env_args:
   map_name: "3Duav" # 建议给你的场景起个名字，用于日志记录
-  n_agents: 3
+    n_agents: 1
   n_static_obstacles: 0
+  space_size: 40.0
+  goal_radius: 8.0
+  v_max: 1.0
+  dt: 0.2
+  episode_limit: 300
+  max_steps: 300
+  randomize_every_reset: false
+  fixed_initial_positions: true
+  use_normalized_actions: true
 
-  # 物理与空间限制
-  space_size: 100.0
-  goal_radius: 5.0
-  v_max: 2.0
-  dt: 0.2 # 时间步长，这个对连续控制的物理反馈非常重要，建议取消注释
-  episode_limit: 200 # 每个episode的最大步数
-  max_steps: 200 # 同上，确保与limit一致
+  safe_uav_dist: 6.0
+  collision_dist: 2.0
+  near_uav_dist: 6.0
+  safe_dist_obs: 6.0
+  lidar_num_rays: 8
+  lidar_vertical_rays: 2
 
   # 状态/观测配置 (参考 SC2)
   state_last_action: True # 在全局 State 中包含上一步动作，对 Critic 很重要
@@ -22,14 +30,15 @@ env_args:
   obs_agent_id: False # 同上，Agent 网络通常会自动 concat ID
 
   # 奖励函数参数 (建议放在这里以便通过 yaml 调参，而不用改代码)
-#  reward_args:
-#    k_prog: 10.0      # 接近目标的奖励权重
-#    k_coll_obs: 1.0   # 撞障碍物惩罚权重
-#    k_coll_agent: 1.0 # 撞队友惩罚权重
-#    k_goal: 200.0     # 到达目标奖励
-#    k_time: -0.1      # 时间惩罚 (鼓励快速到达)，建议设为负的小值
-#    safe_dist_obs: 2.0
-#    reward_clip: 20.0
+reward:
+    progress_scale: 2.0
+    step_penalty: -0.01
+    arrival_bonus: 12.0
+    collision_penalty: -12.0
+    near_obs_scale: 0.0
+    near_uav_scale: 0.0
+    team_all_arrived_bonus: 0.0
+    team_any_collision_penalty: 0.0
 
   # 调试模式
   debug: False

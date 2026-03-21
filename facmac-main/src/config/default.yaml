@@ -63,3 +63,6 @@ plot_loss_network: False
 verbose: False
 optimizer: rmsprop
 target_update_mode: hard
+print_components: False # Print env info['components'] each step
+save_3d_trajectory: True # Save 3D trajectory images via env.render at episode end
+artifact_save_interval: 100 # Save components JSON and trajectory PNG every N episodes
