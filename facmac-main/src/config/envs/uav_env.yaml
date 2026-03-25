@@ -4,7 +4,7 @@ env: uav
 # 这些参数会被传递给你的 UAV 环境类的 __init__ 方法
 env_args:
   map_name: "3Duav" # 建议给你的场景起个名字，用于日志记录
-    n_agents: 1
+  n_agents: 3
   n_static_obstacles: 0
   space_size: 40.0
   goal_radius: 8.0
@@ -12,8 +12,8 @@ env_args:
   dt: 0.2
   episode_limit: 300
   max_steps: 300
-  randomize_every_reset: false
-  fixed_initial_positions: true
+  randomize_every_reset: true
+  fixed_initial_positions: false
   use_normalized_actions: true
 
   safe_uav_dist: 6.0
@@ -37,24 +37,27 @@ reward:
     collision_penalty: -12.0
     near_obs_scale: 0.0
     near_uav_scale: 0.0
+    near_boundary_scale: 0.5
+    safe_dist_boundary: 6.0
     team_all_arrived_bonus: 0.0
     team_any_collision_penalty: 0.0
 
+
   # 调试模式
-  debug: False
-  seed: 42 # 可以固定环境随机种子
+debug: False
+seed: 42 # 可以固定环境随机种子
 
   # 结果与日志
-  results_dir: "results"
-  save_episode_json: False
-  results_keep_last: 500
-  summary_csv_path: "results/summary.csv"
+results_dir: "results"
+save_episode_json: False
+results_keep_last: 500
+summary_csv_path: "results/summary.csv"
 
   # 日志配置
-  log_env_reset: False
-  log_goal_event: False
-  log_episode_save: False
-  logger_name: "MultiUAVEnv"
+log_env_reset: False
+log_goal_event: False
+log_episode_save: False
+logger_name: "MultiUAVEnv"
 
 # --- 2. 运行与日志参数 (Runner & Logging) ---
 # 这些参数控制训练流程，必须与算法参数区分开

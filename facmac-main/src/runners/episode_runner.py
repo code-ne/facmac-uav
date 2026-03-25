@@ -231,7 +231,13 @@ class EpisodeRunner:
             # Collect per-step reward components as a robust fallback when
             # final env_info does not include episode_components.
             try:
-                comps = env_info.get("components", None) if isinstance(env_info, dict) else None
+                comps = None
+                if isinstance(env_info, dict):
+                    comps = env_info.get("components", None)
+                    if comps is None:
+                        reward_info = env_info.get("reward_info", None)
+                        if isinstance(reward_info, dict):
+                            comps = reward_info.get("components", None)
                 if comps is None:
                     step_components_seq.append(None)
                 else:
@@ -347,12 +353,56 @@ class EpisodeRunner:
 
         # NEW: package per-episode payload for external logger
         # scalars from env/episode
-        success_rate = last_env_info.get("success_rate") if isinstance(last_env_info, dict) else None
-        collision_rate = last_env_info.get("collision_rate") if isinstance(last_env_info, dict) else None
-        latency_rate = last_env_info.get("avg_latency_rate") if isinstance(last_env_info, dict) else None
-        # Prefer explicit episode flags when available
-        episode_success_all = last_env_info.get("episode_success_all") if isinstance(last_env_info, dict) else None
-        episode_collision_any = last_env_info.get("episode_collision_any") if isinstance(last_env_info, dict) else None
+        success_rate = None
+        collision_rate = None
+        latency_rate = None
+        episode_success_all = None
+        episode_collision_any = None
+        if isinstance(last_env_info, dict):
+            success_rate = last_env_info.get("success_rate")
+            if success_rate is None:
+                success_all = last_env_info.get("success_all")
+                if isinstance(success_all, bool):
+                    success_rate = 1.0 if success_all else 0.0
+                elif isinstance(success_all, (int, float, np.integer, np.floating)):
+                    success_rate = float(success_all)
+                else:
+                    arrived_mask = last_env_info.get("arrived_mask")
+                    if isinstance(arrived_mask, (list, tuple, np.ndarray)) and len(arrived_mask) > 0:
+                        try:
+                            success_rate = float(np.mean(np.array(arrived_mask, dtype=float)))
+                        except Exception:
+                            success_rate = None
+
+            collision_rate = last_env_info.get("collision_rate")
+            if collision_rate is None:
+                collision_any = last_env_info.get("collision_any")
+                if isinstance(collision_any, bool):
+                    collision_rate = 1.0 if collision_any else 0.0
+                elif isinstance(collision_any, (int, float, np.integer, np.floating)):
+                    collision_rate = float(collision_any)
+                else:
+                    crashed_mask = last_env_info.get("crashed_mask")
+                    if isinstance(crashed_mask, (list, tuple, np.ndarray)) and len(crashed_mask) > 0:
+                        try:
+                            collision_rate = float(np.mean(np.array(crashed_mask, dtype=float)))
+                        except Exception:
+                            collision_rate = None
+
+            latency_rate = last_env_info.get("avg_latency_rate")
+
+            # Prefer explicit episode flags when available; fallback to env canonical keys.
+            episode_success_all = last_env_info.get("episode_success_all")
+            if not isinstance(episode_success_all, bool):
+                success_all = last_env_info.get("success_all")
+                if isinstance(success_all, bool):
+                    episode_success_all = success_all
+
+            episode_collision_any = last_env_info.get("episode_collision_any")
+            if not isinstance(episode_collision_any, bool):
+                collision_any = last_env_info.get("collision_any")
+                if isinstance(collision_any, bool):
+                    episode_collision_any = collision_any
         self.last_episode_env_scalars = {
             "total_reward": float(episode_return),
             "success_rate": success_rate,
@@ -378,7 +428,8 @@ class EpisodeRunner:
         self._global_episode_id += 1
         run_token = str(getattr(self.args, "unique_token", "run"))
         save_interval = max(1, int(getattr(self.args, "artifact_save_interval", 10)))
-        should_save_artifacts = (episode_id % save_interval) == 0
+        # Only save heavy artifacts for training episodes to avoid test-rollout duplicates.
+        should_save_artifacts = (not test_mode) and ((episode_id % save_interval) == 0)
         render_dir = os.path.join(self.args.local_results_path, "renders", run_token)
         comp_json_path = None
         render_png_path = None
@@ -429,7 +480,11 @@ class EpisodeRunner:
                 min_dist_to_goal = last_env_info.get("min_dist_to_goal") if isinstance(last_env_info, dict) else None
                 termination_reason = last_env_info.get("termination_reason") if isinstance(last_env_info, dict) else None
                 env_max_steps = last_env_info.get("max_steps") if isinstance(last_env_info, dict) else None
-                env_episode_limit = last_env_info.get("episode_limit") if isinstance(last_env_info, dict) else None
+                env_episode_limit = last_env_info.get("episode_limit_steps") if isinstance(last_env_info, dict) else None
+                if env_max_steps is None and hasattr(base_env, "max_steps"):
+                    env_max_steps = int(getattr(base_env, "max_steps"))
+                if env_episode_limit is None and hasattr(self.env, "episode_limit"):
+                    env_episode_limit = int(getattr(self.env, "episode_limit"))
                 with open(comp_json_path, "w", encoding="utf-8") as f:
                     json.dump(
                         {
@@ -487,7 +542,7 @@ class EpisodeRunner:
             try:
                 os.makedirs(render_dir, exist_ok=True)
                 render_png_path = os.path.join(render_dir, "episode_{:06d}_3d.png".format(episode_id))
-                base_env.render(save_path=render_png_path, traj=traj_seq)
+                base_env.render(save_path=render_png_path, traj=traj_seq, info=last_env_info)
                 self.last_episode_details["render_3d_path"] = render_png_path
                 self.logger.console_logger.info("Saved 3D trajectory render to {}".format(render_png_path))
             except Exception as e:

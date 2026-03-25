@@ -331,6 +331,38 @@ def run_sequential(args, logger, dual_logger=None):
     else:
         condition_fn = lambda runner, episode: runner.t_env <= args.t_max
 
+    train_env_scalar_keys = ["total_reward", "success_rate", "collision_rate"]
+    test_env_scalar_keys = ["total_reward", "success_rate", "collision_rate"]
+    test_block_id = 0
+
+    def _safe_scalar(value, default=0.0):
+        try:
+            if value is None:
+                return float(default)
+            if hasattr(value, "item"):
+                value = value.item()
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _safe_scalar_or_none(value):
+        try:
+            if value is None:
+                return None
+            if hasattr(value, "item"):
+                value = value.item()
+            return float(value)
+        except Exception:
+            return None
+
+    def _prefix_scalars(scalars, phase):
+        out = {}
+        for k, v in scalars.items():
+            sv = _safe_scalar_or_none(v)
+            if sv is not None:
+                out["{}/{}".format(phase, k)] = sv
+        return out
+
     while condition_fn(runner, episode):
 
         # Run for a whole episode at a time
@@ -341,7 +373,7 @@ def run_sequential(args, logger, dual_logger=None):
             buffer.insert_episode_batch(episode_batch)
 
             # 训练阶段
-            if buffer.can_sample(args.batch_size) and (buffer.episodes_in_buffer > getattr(args, "buffer_warmup", 0)):
+            if buffer.can_sample(args.batch_size) and (buffer.episodes_in_buffer >= getattr(args, "buffer_warmup", 0)):
                 episode_sample = buffer.sample(args.batch_size)
 
                 # Truncate batch to only filled timesteps
@@ -364,15 +396,33 @@ def run_sequential(args, logger, dual_logger=None):
                 # ====== END 奖励归一化 ======
 
                 learner.train(episode_sample, runner.t_env, episode)
+            elif episode > 0 and episode % 20 == 0:
+                logger.console_logger.info(
+                    "Warmup gate: episodes_in_buffer={} (need batch_size={} and buffer_warmup={})".format(
+                        int(buffer.episodes_in_buffer),
+                        int(args.batch_size),
+                        int(getattr(args, "buffer_warmup", 0)),
+                    )
+                )
 
             # NEW: write per-episode logs (TensorBoard scalars + JSONL details)
             if dual_logger is not None and getattr(runner, "last_episode_env_scalars", None) is not None:
-                scalars = dict(runner.last_episode_env_scalars)
-                # 增加最新的loss与Q/TD统计到JSON/TensorBoard
+                scalars = {}
+                env_scalars = dict(runner.last_episode_env_scalars)
+                for k in train_env_scalar_keys:
+                    sv = _safe_scalar_or_none(env_scalars.get(k, None))
+                    if sv is not None:
+                        scalars[k] = sv
+
+                # 增加最新的loss与Q/TD统计到JSON/TensorBoard（仅在可用时写入）
                 if hasattr(learner, "last_pg_loss") and learner.last_pg_loss is not None:
-                    scalars["actor_loss"] = learner.last_pg_loss
+                    sv = _safe_scalar_or_none(learner.last_pg_loss)
+                    if sv is not None:
+                        scalars["actor_loss"] = sv
                 if hasattr(learner, "last_critic_loss") and learner.last_critic_loss is not None:
-                    scalars["critic_loss"] = learner.last_critic_loss
+                    sv = _safe_scalar_or_none(learner.last_critic_loss)
+                    if sv is not None:
+                        scalars["critic_loss"] = sv
                 # if hasattr(learner, "last_q_mean") and learner.last_q_mean is not None:
                 #     scalars["q_mean"] = learner.last_q_mean
                 # if hasattr(learner, "last_q_std") and learner.last_q_std is not None:
@@ -381,11 +431,7 @@ def run_sequential(args, logger, dual_logger=None):
                 #     scalars["td_error_mean"] = learner.last_td_error_mean
                 # if hasattr(learner, "last_td_error_std") and learner.last_td_error_std is not None:
                 #     scalars["td_error_std"] = learner.last_td_error_std
-                # 去掉None值避免TB异常
-                # scalars = {k: v for k, v in scalars.items() if v is not None}
-                scalars = {k: scalars[k] for k in ["total_reward", "critic_loss", "actor_loss",
-                                                   "success_rate", "collision_rate"]
-                           if k in scalars}
+                train_tb_scalars = _prefix_scalars(scalars, "train")
 
 
                 # dual_logger.log_details(details)
@@ -395,41 +441,45 @@ def run_sequential(args, logger, dual_logger=None):
                 if getattr(runner, "last_episode_details", None) is not None:
                     details.update(runner.last_episode_details)
                 details.update({
+                    "phase": "train",
+                    "record_type": "episode",
                     "t_env": int(runner.t_env),
                     "unique_token": args.unique_token,
                 })
 
-                # 自动生成轨迹图（如有）
-                images = None
-                try:
-                    traj = details.get('trajectory')
-                    if traj:
-                        import matplotlib
-                        matplotlib.use('Agg')
-                        import matplotlib.pyplot as plt
-                        import numpy as _np
-                        fig, ax = plt.subplots()
-                        traj_arr = _np.array(traj)
-                        if traj_arr.ndim == 3 and traj_arr.shape[2] >= 2:
-                            T, n_agents, dim = traj_arr.shape
-                            for aid in range(n_agents):
-                                xs = traj_arr[:, aid, 0]
-                                ys = traj_arr[:, aid, 1]
-                                ax.plot(xs, ys, marker='o', label=f'agent_{aid}')
-                            ax.set_title(f'Episode {episode} trajectory')
-                            ax.set_xlabel('x')
-                            ax.set_ylabel('y')
-                            ax.legend()
-                            images = { 'trajectory': fig }
-                        else:
-                            plt.close(fig)
-                            images = None
-                except Exception:
-                    images = None
-
                 SAVE_INTERVAL = 100
                 if runner.t_env % SAVE_INTERVAL == 0:
-                    dual_logger.log_episode(episode=episode, scalars=scalars, details=details, images=images)
+                    # 自动生成轨迹图（如有），仅在保存周期触发，避免每轮触发matplotlib日志与开销。
+                    images = None
+                    try:
+                        traj = details.get('trajectory')
+                        if traj:
+                            import matplotlib
+                            matplotlib.use('Agg')
+                            import matplotlib.pyplot as plt
+                            import numpy as _np
+                            fig, ax = plt.subplots()
+                            traj_arr = _np.array(traj)
+                            if traj_arr.ndim == 3 and traj_arr.shape[2] >= 2:
+                                T, n_agents, dim = traj_arr.shape
+                                for aid in range(n_agents):
+                                    xs = traj_arr[:, aid, 0]
+                                    ys = traj_arr[:, aid, 1]
+                                    ax.plot(xs, ys, marker='o', label=f'agent_{aid}')
+                                ax.set_title(f'Episode {episode} trajectory')
+                                ax.set_xlabel('x')
+                                ax.set_ylabel('y')
+                                ax.legend()
+                                images = { 'trajectory': fig }
+                            else:
+                                plt.close(fig)
+                                images = None
+                    except Exception:
+                        images = None
+
+                    dual_logger.log_episode(episode=episode, scalars=train_tb_scalars, details=details, images=images)
+                else:
+                    dual_logger.log_episode(episode=episode, scalars=train_tb_scalars, details=details, images=None)
 
                 # try:
                 #     dual_logger.log_episode(episode=episode, scalars=scalars, details=details, images=images)
@@ -450,6 +500,31 @@ def run_sequential(args, logger, dual_logger=None):
 
             last_test_T = runner.t_env
             if getattr(args, "testing_on", True):
+                logger.console_logger.info(
+                    "[PHASE][TEST][START] block={} t_env={} episodes={}".format(
+                        test_block_id,
+                        int(runner.t_env),
+                        int(n_test_runs),
+                    )
+                )
+
+                if dual_logger is not None:
+                    dual_logger.log_episode(
+                        episode=int(runner.t_env),
+                        scalars={},
+                        details={
+                            "phase": "test",
+                            "record_type": "phase_marker",
+                            "marker": "test_start",
+                            "test_block_id": int(test_block_id),
+                            "t_env": int(runner.t_env),
+                            "n_test_runs": int(n_test_runs),
+                            "unique_token": args.unique_token,
+                        },
+                        images=None,
+                    )
+
+                test_episode_scalars = []
                 for _ in range(n_test_runs):
                     if getattr(args, "runner_scope", "episodic") == "episodic":
                         runner.run(test_mode=True, learner=learner)
@@ -460,6 +535,68 @@ def run_sequential(args, logger, dual_logger=None):
                                    episode = episode)
                     else:
                         raise Exception("Undefined runner scope!")
+
+                    if getattr(runner, "last_episode_env_scalars", None) is not None:
+                        one = {}
+                        for k in test_env_scalar_keys:
+                            sv = _safe_scalar_or_none(runner.last_episode_env_scalars.get(k, None))
+                            if sv is not None:
+                                one[k] = sv
+                        if len(one) > 0:
+                            test_episode_scalars.append(one)
+
+                if test_episode_scalars:
+                    all_keys = sorted({k for row in test_episode_scalars for k in row.keys()})
+                    test_mean_scalars = {}
+                    for key in all_keys:
+                        values = [x[key] for x in test_episode_scalars if key in x]
+                        if len(values) > 0:
+                            test_mean_scalars[key] = float(np.mean(values))
+                else:
+                    test_mean_scalars = {}
+
+                logger.console_logger.info(
+                    "[PHASE][TEST][END] block={} t_env={} return={:.3f} succ={:.3f} coll={:.3f}".format(
+                        test_block_id,
+                        int(runner.t_env),
+                        test_mean_scalars.get("total_reward", 0.0),
+                        test_mean_scalars.get("success_rate", 0.0),
+                        test_mean_scalars.get("collision_rate", 0.0),
+                    )
+                )
+
+                if dual_logger is not None:
+                    dual_logger.log_episode(
+                        episode=int(runner.t_env),
+                        scalars=_prefix_scalars(test_mean_scalars, "test"),
+                        details={
+                            "phase": "test",
+                            "record_type": "test_block_summary",
+                            "test_block_id": int(test_block_id),
+                            "t_env": int(runner.t_env),
+                            "n_test_runs": int(n_test_runs),
+                            "test_mean_scalars": test_mean_scalars,
+                            "unique_token": args.unique_token,
+                        },
+                        images=None,
+                    )
+
+                    dual_logger.log_episode(
+                        episode=int(runner.t_env),
+                        scalars={},
+                        details={
+                            "phase": "test",
+                            "record_type": "phase_marker",
+                            "marker": "test_end",
+                            "test_block_id": int(test_block_id),
+                            "t_env": int(runner.t_env),
+                            "n_test_runs": int(n_test_runs),
+                            "unique_token": args.unique_token,
+                        },
+                        images=None,
+                    )
+
+                test_block_id += 1
 
         if args.save_model and (runner.t_env - model_save_time >= args.save_model_interval or model_save_time == 0):
             model_save_time = runner.t_env
@@ -476,29 +613,37 @@ def run_sequential(args, logger, dual_logger=None):
 
         episode += args.batch_size_run
 
-        # 只在每100轮输出一次终端统计信息
         if episode > 0 and episode % 10 == 0:
-            # 确保 scalars 已定义，否则用空字典
-            if 'scalars' not in locals():
+            if 'scalars' not in locals() or scalars is None:
                 scalars = {}
-            logger.log_stat("total_reward", scalars.get("total_reward", 0), runner.t_env)
-            logger.log_stat("critic_loss", scalars.get("critic_loss", 0), runner.t_env)
-            logger.log_stat("actor_loss", scalars.get("actor_loss", 0), runner.t_env)
-            logger.log_stat("success_rate", scalars.get("success_rate", 0), runner.t_env)
-            logger.log_stat("collision_rate", scalars.get("collision_rate", 0), runner.t_env)
-            logger.log_stat("episode", episode, runner.t_env)
 
-            # 打印终端，只打印关键指标
+            total_reward = _safe_scalar(scalars.get("total_reward", 0.0))
+            #critic_loss = _safe_scalar(scalars.get("critic_loss", 0.0))
+            #actor_loss = _safe_scalar(scalars.get("actor_loss", 0.0))
+            critic_loss = _safe_scalar(scalars.get("critic_loss", getattr(learner, "last_critic_loss", 0.0)))
+            actor_loss = _safe_scalar(scalars.get("pg_loss", scalars.get("actor_loss", getattr(learner, "last_pg_loss", 0.0))))
+            success_rate = _safe_scalar(scalars.get("success_rate", 0.0))
+            collision_rate = _safe_scalar(scalars.get("collision_rate", 0.0))
+            
+
+            logger.log_stat("total_reward", total_reward, runner.t_env)
+            logger.log_stat("critic_loss", critic_loss, runner.t_env)
+            logger.log_stat("actor_loss", actor_loss, runner.t_env)
+            logger.log_stat("success_rate", success_rate, runner.t_env)
+            logger.log_stat("collision_rate", collision_rate, runner.t_env)
+            logger.log_stat("episode", int(episode), runner.t_env)
+
             print(
-                f"[E{episode}] "
-                f"R: {scalars.get('total_reward', 0):.3f} | "
-                f"CriticL: {scalars.get('critic_loss', 0):.2f} | "
-                f"ActorL: {scalars.get('actor_loss', 0):.2f} | "
-                f"Succ: {scalars.get('success_rate', 0):.2f} | "
-                f"Coll: {scalars.get('collision_rate', 0):.2f}"
+                f"[TRAIN][E{int(episode)}] "
+                f"R: {total_reward:.3f} | "
+                f"CriticL: {critic_loss:.2f} | "
+                f"ActorL: {actor_loss:.2f} | "
+                f"Succ: {success_rate:.2f} | "
+                f"Coll: {collision_rate:.2f}"
             )
 
             last_log_T = runner.t_env
+
         # 原有：if (runner.t_env - last_log_T) >= args.log_interval:
         #     logger.log_stat("episode", episode, runner.t_env)
         #     logger.print_recent_stats()

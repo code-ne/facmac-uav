@@ -32,6 +32,7 @@ def compute_step_reward(
     MOD-R4: add smoothness penalty to stabilize continuous control.
     MOD-R5: add cooperative team bonus/penalty to align with summed FACMAC reward.
     """
+
     cfg = {
         "progress_scale": 2.0,
         "step_penalty": -0.01,
@@ -39,8 +40,11 @@ def compute_step_reward(
         "collision_penalty": -15.0,
         "near_obs_scale": 2.0,
         "near_uav_scale": 2.0,
+        "near_boundary_scale": 1.0,
         "safe_dist_obs": 6.0,
         "safe_dist_uav": 6.0,
+        "safe_dist_boundary": 6.0,
+        "space_size": 40.0,
         "velocity_norm_penalty": 0.00,
         "team_all_arrived_bonus": 20.0,
         "team_any_collision_penalty": -5.0,
@@ -98,6 +102,7 @@ def compute_step_reward(
             "collision_penalty": 0.0,
             "near_obstacle_penalty": 0.0,
             "near_uav_penalty": 0.0,
+            "near_boundary_penalty": 0.0,
             "velocity_penalty": 0.0,
             "team_bonus_share": 0.0,
             "total": 0.0,
@@ -128,6 +133,21 @@ def compute_step_reward(
 
         uav_margin = max(0.0, cfg["safe_dist_uav"] - float(nearest_uav_dists[i]))
         comp["near_uav_penalty"] = -cfg["near_uav_scale"] * uav_margin
+        
+        space_size = float(cfg["space_size"])
+        nearest_boundary_dist = min(
+            float(positions[i][0]),
+            float(positions[i][1]),
+            float(positions[i][2]),
+            space_size - float(positions[i][0]),
+            space_size - float(positions[i][1]),
+            space_size - float(positions[i][2]),
+        )
+        boundary_margin = max(0.0, cfg["safe_dist_boundary"] - nearest_boundary_dist)
+        comp["near_boundary_penalty"] = -cfg["near_boundary_scale"] * (
+            boundary_margin / max(float(cfg["safe_dist_boundary"]), 1e-6)
+        )
+        
 
         speed_norm = np.linalg.norm(velocities[i]) / max(float(v_max), 1e-6)
         comp["velocity_penalty"] = -cfg["velocity_norm_penalty"] * speed_norm
@@ -160,6 +180,14 @@ def compute_step_reward(
         "stats": {
             "min_nearest_obstacle_dist": _safe_min(nearest_obstacle_dists, np.inf),
             "min_nearest_uav_dist": _safe_min(nearest_uav_dists, np.inf),
+            "min_nearest_boundary_dist": float(np.min(np.min(np.stack([
+                positions[:, 0],
+                positions[:, 1],
+                positions[:, 2],
+                float(cfg["space_size"]) - positions[:, 0],
+                float(cfg["space_size"]) - positions[:, 1],
+                float(cfg["space_size"]) - positions[:, 2],
+            ], axis=1), axis=1))),
         },
     }
     return rewards.tolist(), info

@@ -17,9 +17,9 @@ agent_output_type: "pi_mean" # 连续控制：输出动作分布的均值
 
 # --- Training Hyperparameters ---
 batch_size_run: 1
-batch_size: 64 # 无人机环境通常状态较简单，适当增大batch size有助于稳定梯度
+batch_size: 32 # 适中批量，便于更快开始更新
 buffer_size: 10000 # 增大缓存，路径规划任务通常episode较长
-buffer_warmup: 500 # 预热步数 （ReplayBuffer 里至少有100个 episode产生的数据后，才允许训练，在 buffer ≥ warmup 之后：几乎“边采样边训练”）
+buffer_warmup: 32 # 预热集数；避免长时间只采样不学习
 discretize_actions: False # 关键：关闭离散化
 double_q: True # 开启Double Q以减少过估计
 epsilon_decay_mode: "linear"

@@ -191,8 +191,10 @@ class MultiUAVEnv:
         self.arrived_mask = np.zeros(self.n_agents, dtype=bool)
         self.crashed_mask = np.zeros(self.n_agents, dtype=bool)
         self.colliding_mask = np.zeros(self.n_agents, dtype=bool)
+        self.moved_steps = np.zeros(self.n_agents, dtype=int)
         self.first_arrival_step = np.full(self.n_agents, -1, dtype=int)
         self.first_collision_step = np.full(self.n_agents, -1, dtype=int)
+        self.first_collision_reason = [None for _ in range(self.n_agents)]
         self.min_dist_to_goal = np.linalg.norm(self.pos - self.goal, axis=1)
         self.episode_rewards = []
         self.episode_per_agent_rewards = []
@@ -432,7 +434,10 @@ class MultiUAVEnv:
             self.last_actions = desired_vel / max(self.v_max, 1e-6)
         
         collided_this_step = np.zeros(self.n_agents, dtype=bool)
+        collision_reason_this_step = [None for _ in range(self.n_agents)]
         arrived_this_step = np.zeros(self.n_agents, dtype=bool)
+        reached_by_segment_step = np.zeros(self.n_agents, dtype=bool)
+        reached_by_distance_step = np.zeros(self.n_agents, dtype=bool)
         
         # 更新速度和位置
         for i in range(self.n_agents):
@@ -458,15 +463,20 @@ class MultiUAVEnv:
             intended_pos = prev_pos[i] + self.vel[i] * self.dt
             if self._is_out_of_bounds(intended_pos):
                 collided_this_step[i] = True
+                collision_reason_this_step[i] = "boundary"
 
             for obs in self.obstacles:
                 if obs.collides_point(self.pos[i]) or _segment_intersects_cylinder(prev_pos[i], self.pos[i], obs):
                     collided_this_step[i] = True
+                    if collision_reason_this_step[i] is None:
+                        collision_reason_this_step[i] = "obstacle"
                     break
 
             if _segment_intersects_sphere(prev_pos[i], self.pos[i], self.goal, self.goal_radius):
+                reached_by_segment_step[i] = True
                 arrived_this_step[i] = True
             elif np.linalg.norm(self.pos[i] - self.goal) <= self.goal_radius:
+                reached_by_distance_step[i] = True
                 arrived_this_step[i] = True
         
         # MOD-E4: pairwise UAV collision checks.
@@ -480,17 +490,33 @@ class MultiUAVEnv:
                 if seg_dist <= self.collision_dist:
                     collided_this_step[i] = True
                     collided_this_step[j] = True
-        
+                    if collision_reason_this_step[i] is None:
+                        collision_reason_this_step[i] = "uav_pair"
+                    if collision_reason_this_step[j] is None:
+                        collision_reason_this_step[j] = "uav_pair"
+
+        # Arrival-priority policy: if an agent reaches the goal this step,
+        # same-step collisions are ignored for that agent.
+        collided_this_step_raw = collided_this_step.copy()
+        collided_this_step = collided_this_step_raw & (~arrived_this_step)
+        collision_reason_effective = [
+            (collision_reason_this_step[i] if collided_this_step[i] else None)
+            for i in range(self.n_agents)
+        ]
+
         self.crashed_mask |= collided_this_step
-        new_arrivals = arrived_this_step & (~self.crashed_mask) & (~self.arrived_mask)
+        new_arrivals = arrived_this_step & (~self.arrived_mask)
         self.arrived_mask |= new_arrivals
         self.colliding_mask = collided_this_step.copy()
+        moved_this_step = (np.linalg.norm(self.pos - prev_pos, axis=1) > 1e-9)
+        self.moved_steps += moved_this_step.astype(int)
 
         for i in range(self.n_agents):
             if new_arrivals[i] and self.first_arrival_step[i] < 0:
                 self.first_arrival_step[i] = self.step_count
             if collided_this_step[i] and self.first_collision_step[i] < 0:
                 self.first_collision_step[i] = self.step_count
+                self.first_collision_reason[i] = collision_reason_effective[i]
         
         self.min_dist_to_goal = np.minimum(self.min_dist_to_goal, np.linalg.norm(self.pos - self.goal, axis=1))
 
@@ -500,6 +526,7 @@ class MultiUAVEnv:
         reward_cfg = dict(self.cfg.get("reward", {}))
         reward_cfg.setdefault("safe_dist_obs", self.safe_dist_obs)
         reward_cfg.setdefault("safe_dist_uav", self.near_uav_dist)
+        reward_cfg.setdefault("space_size", self.space_size)
 
         rewards, reward_info = compute_step_reward(
             positions=self.pos,
@@ -516,29 +543,77 @@ class MultiUAVEnv:
             nearest_uav_dists=nearest_uav_dists,
             reward_cfg=reward_cfg,
         )
+
+        components = reward_info.get("components", None) if isinstance(reward_info, dict) else None
+        self.episode_rewards.append(float(np.sum(rewards)))
+        self.episode_per_agent_rewards.append(list(rewards))
+        self.episode_components.append(components if components is not None else [])
         
         obs, state = self._get_obs_state()
+        all_resolved = bool(np.all(self.arrived_mask | self.crashed_mask))
+        reached_by_segment = self.arrived_mask & reached_by_segment_step
+        reached_by_distance = self.arrived_mask & reached_by_distance_step
         done = bool(
             self.step_count >= self.max_steps
-            or np.all(self.arrived_mask | self.crashed_mask)
+            or all_resolved
         )
+
+        termination_reason = None
+        if done:
+            if self.step_count >= self.max_steps and (not all_resolved):
+                termination_reason = "max_steps"
+            elif all_resolved:
+                termination_reason = "all_agents_resolved"
+            else:
+                termination_reason = "done"
+
+        per_agent_arrival_audit = []
+        for i in range(self.n_agents):
+            per_agent_arrival_audit.append(
+                {
+                    "agent_id": int(i),
+                    "arrived": bool(self.arrived_mask[i]),
+                    "crashed": bool(self.crashed_mask[i]),
+                    "reached_by_segment": bool(reached_by_segment[i]),
+                    "reached_by_distance": bool(reached_by_distance[i]),
+                    "moved_steps": int(self.moved_steps[i]),
+                    "first_arrival_step": int(self.first_arrival_step[i]),
+                    "first_collision_step": int(self.first_collision_step[i]),
+                    "first_collision_reason": self.first_collision_reason[i],
+                    "min_dist_to_goal": float(self.min_dist_to_goal[i]),
+                }
+            )
 
         info = {
             "arrived_mask": self.arrived_mask.astype(int).tolist(),
             "crashed_mask": self.crashed_mask.astype(int).tolist(),
             "collided_this_step": collided_this_step.astype(int).tolist(),
+            "collided_this_step_raw": collided_this_step_raw.astype(int).tolist(),
+            "collision_suppressed_by_arrival": (collided_this_step_raw & arrived_this_step).astype(int).tolist(),
+            "collision_reason_this_step": collision_reason_effective,
+            "collision_reason_this_step_raw": collision_reason_this_step,
             "arrived_this_step": new_arrivals.astype(int).tolist(),
             "nearest_obstacle_dists": nearest_obstacle_dists.tolist(),
             "nearest_uav_dists": nearest_uav_dists.tolist(),
             "episode_step": self.step_count,
+            "components": components,
+            "episode_components": self.episode_components,
             "reward_info": reward_info,
             "success_all": bool(np.all(self.arrived_mask)),
             "collision_any": bool(np.any(self.crashed_mask)),
+            "arrival_mode": "segment_or_distance_arrival_priority",
+            "reached_by_distance": reached_by_distance.astype(int).tolist(),
+            "reached_by_segment": reached_by_segment.astype(int).tolist(),
+            "moved_steps": self.moved_steps.astype(int).tolist(),
+            "moved_this_step": moved_this_step.astype(int).tolist(),
+            "first_collision_reason": self.first_collision_reason,
+            "min_dist_to_goal": self.min_dist_to_goal.astype(float).tolist(),
+            "per_agent_arrival_audit": per_agent_arrival_audit,
+            "termination_reason": termination_reason,
+            "max_steps": int(self.max_steps),
+            "episode_limit": bool(self.step_count >= self.max_steps),
+            "episode_limit_steps": int(self.max_steps),
         }
-
-        self.episode_rewards.append(float(np.sum(rewards)))
-        self.episode_per_agent_rewards.append(list(rewards))
-        self.episode_components.append(reward_info.get("components", []))
 
         self.prev_pos = prev_pos
         return obs, state, rewards, done, info
@@ -559,6 +634,170 @@ class MultiUAVEnv:
             "collision_any": float(np.any(self.crashed_mask)),
             "mean_min_goal_dist": float(np.mean(self.min_dist_to_goal)),
         }
+
+    def render(self, save_path=None, traj=None, info=None, elev=24, azim=45):
+        """Render a 3D snapshot/trajectory and optionally save as PNG.
+
+        Args:
+            save_path: PNG output path. If None, returns the figure object.
+            traj: Optional trajectory sequence with shape [T, n_agents, 3].
+            elev: Matplotlib 3D view elevation.
+            azim: Matplotlib 3D view azimuth.
+        """
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as e:
+            self.log.warning("Matplotlib unavailable, skip rendering: %s", e)
+            return None
+
+        fig = plt.figure(figsize=(8, 7))
+        ax = fig.add_subplot(111, projection="3d")
+
+        # Draw environment bounds.
+        ax.set_xlim(0.0, self.space_size)
+        ax.set_ylim(0.0, self.space_size)
+        ax.set_zlim(0.0, self.space_size)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title("MultiUAV 3D Trajectory")
+
+        # Draw goal center and radius sphere so "inside goal range" is directly visible.
+        ax.scatter(
+            [float(self.goal[0])],
+            [float(self.goal[1])],
+            [float(self.goal[2])],
+            s=220,
+            c="tab:green",
+            marker="*",
+            edgecolors="k",
+            linewidths=0.6,
+            label="goal center",
+        )
+        phi = np.linspace(0.0, np.pi, 18)
+        theta_s = np.linspace(0.0, 2.0 * np.pi, 36)
+        gx = self.goal[0] + self.goal_radius * np.outer(np.sin(phi), np.cos(theta_s))
+        gy = self.goal[1] + self.goal_radius * np.outer(np.sin(phi), np.sin(theta_s))
+        gz = self.goal[2] + self.goal_radius * np.outer(np.cos(phi), np.ones_like(theta_s))
+        ax.plot_wireframe(gx, gy, gz, rstride=2, cstride=3, color="tab:green", alpha=0.16, linewidth=0.6)
+
+        # Draw static cylinder obstacles using top/bottom rings and side vertical lines.
+        theta = np.linspace(0.0, 2.0 * np.pi, 40)
+        for obs in self.obstacles:
+            x_ring = obs.x + obs.radius * np.cos(theta)
+            y_ring = obs.y + obs.radius * np.sin(theta)
+            z0 = np.full_like(theta, obs.z_min, dtype=float)
+            z1 = np.full_like(theta, obs.z_max, dtype=float)
+
+            ax.plot(x_ring, y_ring, z0, color="tab:red", alpha=0.55, linewidth=1.0)
+            ax.plot(x_ring, y_ring, z1, color="tab:red", alpha=0.55, linewidth=1.0)
+
+            for idx in range(0, len(theta), 6):
+                ax.plot(
+                    [x_ring[idx], x_ring[idx]],
+                    [y_ring[idx], y_ring[idx]],
+                    [obs.z_min, obs.z_max],
+                    color="tab:red",
+                    alpha=0.32,
+                    linewidth=0.8,
+                )
+
+        traj_arr = None
+        if traj is not None:
+            try:
+                traj_arr = np.asarray(traj, dtype=float)
+                if traj_arr.ndim != 3 or traj_arr.shape[-1] < 3:
+                    traj_arr = None
+            except Exception:
+                traj_arr = None
+
+        if traj_arr is not None and traj_arr.shape[1] > 0:
+            n_agents = int(traj_arr.shape[1])
+            for aid in range(n_agents):
+                xs = traj_arr[:, aid, 0]
+                ys = traj_arr[:, aid, 1]
+                zs = traj_arr[:, aid, 2]
+                line_color = "tab:blue"
+                ax.plot(xs, ys, zs, linewidth=1.8, color=line_color, label="uav_{} trajectory".format(aid + 1))
+
+                # Fixed semantics:
+                # - start: orange triangle
+                # - end: blue circle
+                ax.scatter([xs[0]], [ys[0]], [zs[0]], s=70, marker="^", c="tab:orange", edgecolors="k", linewidths=0.4,
+                           label="start" if aid == 0 else None)
+                ax.scatter([xs[-1]], [ys[-1]], [zs[-1]], s=55, marker="o", c="tab:blue", edgecolors="k", linewidths=0.35,
+                           label="end" if aid == 0 else None)
+
+                # Mark the closest point to the 3D goal center to avoid 2D projection confusion.
+                dists_to_goal = np.sqrt((xs - self.goal[0]) ** 2 + (ys - self.goal[1]) ** 2 + (zs - self.goal[2]) ** 2)
+                min_idx = int(np.argmin(dists_to_goal))
+                min_dist = float(dists_to_goal[min_idx])
+                ax.scatter([xs[min_idx]], [ys[min_idx]], [zs[min_idx]], s=75, marker="D", c="magenta",
+                           edgecolors="k", linewidths=0.35, label="closest-to-goal" if aid == 0 else None)
+                ax.text(xs[min_idx], ys[min_idx], zs[min_idx], "dmin={:.2f}".format(min_dist), color="magenta", fontsize=8)
+
+                # Boundary-hit marker (red X): inferred from first collision reason or trajectory touching bounds.
+                collision_step = None
+                collision_reason = None
+                if isinstance(info, dict):
+                    audit = info.get("per_agent_arrival_audit")
+                    if isinstance(audit, (list, tuple)) and aid < len(audit) and isinstance(audit[aid], dict):
+                        collision_step = int(audit[aid].get("first_collision_step", -1))
+                        collision_reason = audit[aid].get("first_collision_reason")
+
+                hit_idx = None
+                if collision_step is not None and collision_step > 0:
+                    hit_idx = max(0, min(len(xs) - 1, collision_step - 1))
+                else:
+                    eps = 1e-6
+                    boundary_hits = np.where(
+                        (xs <= eps) | (xs >= self.space_size - eps)
+                        | (ys <= eps) | (ys >= self.space_size - eps)
+                        | (zs <= eps) | (zs >= self.space_size - eps)
+                    )[0]
+                    if boundary_hits.size > 0:
+                        hit_idx = int(boundary_hits[0])
+
+                if hit_idx is not None and collision_reason in [None, "boundary", "uav_pair", "obstacle"]:
+                    marker_label = "collision" if aid == 0 else None
+                    ax.scatter([xs[hit_idx]], [ys[hit_idx]], [zs[hit_idx]], s=110, marker="x", c="red", linewidths=2.0,
+                               label=marker_label)
+
+                    # Annotate collision reason when available.
+                    reason_txt = "collision"
+                    if collision_reason == "boundary":
+                        reason_txt = "boundary hit"
+                    elif collision_reason == "obstacle":
+                        reason_txt = "obstacle hit"
+                    elif collision_reason == "uav_pair":
+                        reason_txt = "uav collision"
+
+                    ax.text(xs[hit_idx], ys[hit_idx], zs[hit_idx], reason_txt, color="red", fontsize=8)
+        else:
+            # Fallback: draw only current positions.
+            for aid in range(self.n_agents):
+                p = self.pos[aid]
+                ax.scatter([p[0]], [p[1]], [p[2]], s=45, marker="o", label="uav_{}".format(aid + 1))
+
+        try:
+            ax.legend(loc="upper right", fontsize=8)
+        except Exception:
+            pass
+
+        if save_path:
+            try:
+                out_dir = os.path.dirname(save_path)
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                fig.savefig(save_path, dpi=160, bbox_inches="tight")
+            finally:
+                plt.close(fig)
+            return save_path
+
+        return fig
 
     def close(self):
         return None

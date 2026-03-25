@@ -139,7 +139,17 @@ class FACMACLearner:
         pi = mac_out
 
         # Compute the actor loss
-        pg_loss = -chosen_action_qvals.mean()
+        # pg_loss = -chosen_action_qvals.mean()
+        actor_mask = batch["filled"][:, :-1].float()
+        actor_mask[:, 1:] = actor_mask[:, 1:] * (1 - batch["terminated"][:, :-2].float())
+
+        if self.mixer is not None:
+            actor_mask = actor_mask.view(batch.batch_size, -1, 1)
+        else:
+            actor_mask = actor_mask.expand(-1, -1, self.n_agents)
+
+        pg_loss = - (chosen_action_qvals * actor_mask).sum() / actor_mask.sum()
+
 
         # Optimise agents
         self.agent_optimiser.zero_grad()
